@@ -4,6 +4,9 @@
 #include <esp_task_wdt.h>
 #include "driver/gpio.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 #define LED_PIN_LEVEL_UP 12
 #define LED_PIN_LEVEL_MIDDLE 14
@@ -16,103 +19,172 @@
 #define LEVEL_MIDDLE 1
 #define LEVEL_LOWER 0
 
-
 #define PUSH_TIME_US 250000 // 250 ms
+#define MAX_QUEUE_SIZE 50
 
-// Used to represent a travel need of a passenger.
 struct travel_need {
     int origin;
     int destination;
 };
+
 struct elevator_state {
     int current_level;
     int state;
-    int travel_need_index;
+    int current_index;
+};
+/*
+    
+    Initiera en struct med nivå 0 och state idle.
+    current index -1 (ingen request)
+*/
+static struct elevator_state elevator = {
+    .current_level = LEVEL_LOWER,
+    .state = ELEVATOR_IDLE,
+    .current_index = -1
 };
 
-static struct elevator_state elevator = {LEVEL_LOWER, ELEVATOR_IDLE, -1};
-
-// Used to not allow button pushes that are too close to each other in time
 static volatile uint64_t lastPush = -PUSH_TIME_US;
-
-//Just a counter keeping track of which travel need is next to process.
 static volatile int travel_need_counter = 0;
+static struct travel_need travel_needs[50];  // Your original travel needs array
+static TaskHandle_t elevator_task_handle = NULL;
+static int arrivedAtOrigin = 0;
 
-// This data structure holds information about 
-static volatile struct travel_need travel_needs[50];
+// skapa FREE RTOS QUEUE
+static QueueHandle_t travel_queue = NULL;
 
-// This function is called when button is pushed
-static void handle_push(void *arg) {
-    // Disable interrupts
+void update_led_status() {
+    if(elevator.current_level == LEVEL_LOWER) {
+        gpio_set_level(LED_PIN_LEVEL_MIDDLE, 0);
+        gpio_set_level(LED_PIN_LEVEL_DOWN, 1);
+        gpio_set_level(LED_PIN_LEVEL_UP, 0);
+    }
+    else if(elevator.current_level == LEVEL_MIDDLE) {
+        gpio_set_level(LED_PIN_LEVEL_MIDDLE, 1);
+        gpio_set_level(LED_PIN_LEVEL_DOWN, 0);
+        gpio_set_level(LED_PIN_LEVEL_UP, 0);
+    }
+    else if(elevator.current_level == LEVEL_UPPER) {
+        gpio_set_level(LED_PIN_LEVEL_MIDDLE, 0);
+        gpio_set_level(LED_PIN_LEVEL_DOWN, 0);
+        gpio_set_level(LED_PIN_LEVEL_UP, 1);
+    }
+}
+
+static void IRAM_ATTR handle_push(void *arg) {
     gpio_intr_disable(BUTTON_PIN);
-
-    // Get the current time 
     uint64_t now = esp_timer_get_time();
-
-    // If enough time passed, we should consider this event as a genuine push
+    
     if ((now - lastPush) > PUSH_TIME_US) {
         lastPush = now;
-        printf("Button pushed\n");
-        if(elevator.current_level == LEVEL_LOWER){
-            gpio_set_level(LED_PIN_LEVEL_MIDDLE, 0);
-            gpio_set_level(LED_PIN_LEVEL_DOWN, 1);
-            gpio_set_level(LED_PIN_LEVEL_UP, 0);
-        }
-        else if(elevator.current_level == LEVEL_MIDDLE){
-            gpio_set_level(LED_PIN_LEVEL_MIDDLE, 1);
-            gpio_set_level(LED_PIN_LEVEL_DOWN, 0);
-            gpio_set_level(LED_PIN_LEVEL_UP, 0);
-        }
-        else if(elevator.current_level == LEVEL_UPPER){
-            gpio_set_level(LED_PIN_LEVEL_MIDDLE, 0);
-            gpio_set_level(LED_PIN_LEVEL_DOWN, 0);
-            gpio_set_level(LED_PIN_LEVEL_UP, 1);
-        }
-        // If the elevator is idle, assign the next travel need
-        if (elevator.state == ELEVATOR_IDLE) {
-            elevator.travel_need_index = travel_need_counter;
-            travel_need_counter++;
-            elevator.state = ELEVATOR_LOADING;
+        
+        // Ingen notifikation behövs, vi kollar bara om knappen har tryckts
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        // Elevator task ska köras = priority set to true
+        vTaskNotifyGiveFromISR(elevator_task_handle, &xHigherPriorityTaskWoken);
+        // Om en högre prioritet finns, yield och låt den köras
+        // Kör elevator task
+        //  https://www.freertos.org/Documentation/02-Kernel/04-API-references/05-Direct-to-task-notifications/02-vTaskNotifyGiveFromISR <- Om du glömmer
+        if (xHigherPriorityTaskWoken) {
+            portYIELD_FROM_ISR();
         }
     }
-
-    // Re-enable interrupts
+    
     gpio_intr_enable(BUTTON_PIN);
 }
+
+void elevator_task(void *pvParameters) {
+    esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+    struct travel_need current_travel_need;
     
-    void lala(){
-/*
-         if (elevator.state == ELEVATOR_LOADING) {
-            // Simulate loading time
-       //     vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-            // Move the elevator to the destination level
-            struct travel_need current_travel_need = travel_needs[elevator.travel_need_index];
+    while (1) {
+        esp_task_wdt_reset();
+        
+        // kollar om knappen har tryckts med notifikation. om det inte finns retunerar den 0 direkt. Finnns det lägg till i kön given från rad 83
+        if (ulTaskNotifyTake(pdTRUE, 0) != 0) {
+            if (travel_need_counter < 50) {
+                // kollar om det finns plats i kön, lägger till i så fall
+                struct travel_need new_need = travel_needs[travel_need_counter];
+                if (xQueueSend(travel_queue, &new_need, 0) == pdTRUE) {
+                    printf("Added to queue: Origin %d, Destination %d\n", 
+                           new_need.origin, new_need.destination);
+                    travel_need_counter++;
+                    // Om vi är i idle, börja processa
+                    if (elevator.state == ELEVATOR_IDLE) {
+                        arrivedAtOrigin = 0;
+                        elevator.state = ELEVATOR_LOADING;
+                    }
+                }
+            }
+        }
+        
+        if (elevator.state == ELEVATOR_LOADING) {
+            // om vi inte har något att göra, gå till idle
+            if (arrivedAtOrigin == 0) {
+                // kolla om det finns något i the queue, if not idle och continue
+                if (xQueuePeek(travel_queue, &current_travel_need, 0) != pdTRUE) {
+                    elevator.state = ELEVATOR_IDLE;
+                    continue;
+                }
+            }
+            
             int destination = current_travel_need.destination;
-
-            while (elevator.current_level != destination) {
-                if (elevator.current_level < destination) {
-                   // wait 
+            int origin = current_travel_need.origin;
+            
+            // Om vi inte är på origin, åk dit
+            if (elevator.current_level != origin && arrivedAtOrigin == 0) {
+                printf("Elevator moving to origin %d\n", origin);
+                elevator.state = ELEVATOR_MOVING;
+                
+                if (elevator.current_level < origin) {
                     elevator.current_level++;
                 } else {
                     elevator.current_level--;
                 }
-
-                // Simulate travel time
-                vTaskDelay(5000 / portTICK_PERIOD_MS);
+                
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                update_led_status();
+                elevator.state = ELEVATOR_LOADING;
+            } else {
+                arrivedAtOrigin = 1;
             }
-
-            // Simulate unloading time
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-            // Set elevator to idle
-            elevator.state = ELEVATOR_IDLE;
-        }*/
+            
+            // Om vi inte är på destinationen, åk dit ( så länge vi har varit på origin)
+            if (elevator.current_level != destination && arrivedAtOrigin == 1) {
+                elevator.state = ELEVATOR_MOVING;
+                
+                if (elevator.current_level < destination) {
+                    elevator.current_level++;
+                } else {
+                    elevator.current_level--;
+                }
+                
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                update_led_status();
+                elevator.state = ELEVATOR_LOADING;
+            } else if (elevator.current_level == destination && arrivedAtOrigin == 1) {
+                printf("Arrived at destination %d\n", destination);
+                  vTaskDelay(pdMS_TO_TICKS(2000));
+                xQueueReceive(travel_queue, &current_travel_need, 0); // Ta bort från kön
+                arrivedAtOrigin = 0;
+                
+                // Check if queue is empty
+                if (uxQueueMessagesWaiting(travel_queue) == 0) {
+                    elevator.state = ELEVATOR_IDLE;
+                    printf("Inga fler åkare\n");
+                } else {
+                    printf("Åker till nästa knapptryck!!!!\n");
+                }
+            }
+        }
+        
+        update_led_status();
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
+}
+
 void app_main() {
 
-    //Initialize travel needs (50 randomly generated travel needs)
-    travel_needs[0].origin = 2; travel_needs[0].destination = 1;
+   travel_needs[0].origin = 2; travel_needs[0].destination = 1;
     travel_needs[1].origin = 1; travel_needs[1].destination = 2;
     travel_needs[2].origin = 1; travel_needs[2].destination = 2;
     travel_needs[3].origin = 0; travel_needs[3].destination = 2;
@@ -162,40 +234,37 @@ void app_main() {
     travel_needs[47].origin = 2; travel_needs[47].destination = 1;
     travel_needs[48].origin = 0; travel_needs[48].destination = 2;
     travel_needs[49].origin = 1; travel_needs[49].destination = 0;
+    // Create the FreeRTOS queue
+    travel_queue = xQueueCreate(MAX_QUEUE_SIZE, sizeof(struct travel_need));
+    if (travel_queue == NULL) {
+        printf("Failed to create queue\n");
+        return;
+    }
 
-
-
-     gpio_config_t config;
-    // Configure pins as output
+    // GPIO configuration
+    gpio_config_t config;
     config.pin_bit_mask = (1ULL << LED_PIN_LEVEL_UP) | (1ULL << LED_PIN_LEVEL_MIDDLE) | (1ULL << LED_PIN_LEVEL_DOWN);
     config.mode = GPIO_MODE_OUTPUT;
+    config.pull_up_en = GPIO_PULLUP_DISABLE;
+    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    config.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&config);
-
-    // Configure button pin as input with pull-up and interrupt
+    
+    // Button configuration
     config.pin_bit_mask = (1ULL << BUTTON_PIN);
     config.mode = GPIO_MODE_INPUT;
     config.pull_up_en = GPIO_PULLUP_ENABLE;
     config.intr_type = GPIO_INTR_NEGEDGE;
     gpio_config(&config);
-
-    // Activate the interrupts for the GPIOs
-    //gpio_install_isr_service(0);
-    //gpio_isr_handler_add(BUTTON_PIN, handle_push, NULL);
-    // Activate the interrupts for the GPIOs
+    
     gpio_install_isr_service(0);
-
-
-   
-
-    // Add a handler to the ISR for pin BUTTON_PIN
-     gpio_isr_handler_add(BUTTON_PIN, handle_push, NULL);
-  
-
-    // This is where you most likely put your main elevator code. 
+    gpio_isr_handler_add(BUTTON_PIN, handle_push, NULL);
+    
+    // Create the elevator task
+    xTaskCreate(elevator_task, "elevator_task", 2048, NULL, 5, &elevator_task_handle);
+    
+    // Main loop
     while (1) {
-       lala();
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
-      
-  
-       
 }
