@@ -3,11 +3,19 @@
 #include <esp32/rom/ets_sys.h>
 #include <esp_task_wdt.h>
 #include "driver/gpio.h"
+#include "esp_timer.h"
 
 #define LED_PIN_LEVEL_UP 12
 #define LED_PIN_LEVEL_MIDDLE 14
 #define LED_PIN_LEVEL_DOWN 27
 #define BUTTON_PIN 26
+#define ELEVATOR_IDLE 0
+#define ELEVATOR_MOVING 1
+#define ELEVATOR_LOADING 2
+#define LEVEL_UPPER 2
+#define LEVEL_MIDDLE 1
+#define LEVEL_LOWER 0
+
 
 #define PUSH_TIME_US 250000 // 250 ms
 
@@ -16,6 +24,13 @@ struct travel_need {
     int origin;
     int destination;
 };
+struct elevator_state {
+    int current_level;
+    int state;
+    int travel_need_index;
+};
+
+static struct elevator_state elevator = {LEVEL_LOWER, ELEVATOR_IDLE, -1};
 
 // Used to not allow button pushes that are too close to each other in time
 static volatile uint64_t lastPush = -PUSH_TIME_US;
@@ -28,55 +43,72 @@ static volatile struct travel_need travel_needs[50];
 
 // This function is called when button is pushed
 static void handle_push(void *arg) {
-
     // Disable interrupts
     gpio_intr_disable(BUTTON_PIN);
 
     // Get the current time 
     uint64_t now = esp_timer_get_time();
 
-
     // If enough time passed, we should consider this event as a genuine push
     if ((now - lastPush) > PUSH_TIME_US) {
-       
         lastPush = now;
-
-        //Get next travel need from list and do something with it
-        struct travel_need current_travel_need = travel_needs[travel_need_counter];
-
-
-        //Now we are just blinking the LEDs. You need to update this code.
-        uint32_t level = travel_need_counter % 4;
-
-        if (level == 0) {
-            gpio_set_level(LED_PIN_LEVEL_UP, 1);
+        printf("Button pushed\n");
+        if(elevator.current_level == LEVEL_LOWER){
             gpio_set_level(LED_PIN_LEVEL_MIDDLE, 0);
-            gpio_set_level(LED_PIN_LEVEL_DOWN, 0); 
-        } 
-
-        else if (level == 1 || level == 3) {
+            gpio_set_level(LED_PIN_LEVEL_DOWN, 1);
             gpio_set_level(LED_PIN_LEVEL_UP, 0);
+        }
+        else if(elevator.current_level == LEVEL_MIDDLE){
             gpio_set_level(LED_PIN_LEVEL_MIDDLE, 1);
             gpio_set_level(LED_PIN_LEVEL_DOWN, 0);
-        }
-        
-        else {
             gpio_set_level(LED_PIN_LEVEL_UP, 0);
-            gpio_set_level(LED_PIN_LEVEL_MIDDLE, 0);
-            gpio_set_level(LED_PIN_LEVEL_DOWN, 1); 
         }
-
-        //Increase travel need counter
-        travel_need_counter++;
-
-    } // else ignore
-
-
+        else if(elevator.current_level == LEVEL_UPPER){
+            gpio_set_level(LED_PIN_LEVEL_MIDDLE, 0);
+            gpio_set_level(LED_PIN_LEVEL_DOWN, 0);
+            gpio_set_level(LED_PIN_LEVEL_UP, 1);
+        }
+        // If the elevator is idle, assign the next travel need
+        if (elevator.state == ELEVATOR_IDLE) {
+            elevator.travel_need_index = travel_need_counter;
+            travel_need_counter++;
+            elevator.state = ELEVATOR_LOADING;
+        }
+    }
 
     // Re-enable interrupts
     gpio_intr_enable(BUTTON_PIN);
 }
+    
+    void lala(){
+/*
+         if (elevator.state == ELEVATOR_LOADING) {
+            // Simulate loading time
+       //     vTaskDelay(5000 / portTICK_PERIOD_MS);
 
+            // Move the elevator to the destination level
+            struct travel_need current_travel_need = travel_needs[elevator.travel_need_index];
+            int destination = current_travel_need.destination;
+
+            while (elevator.current_level != destination) {
+                if (elevator.current_level < destination) {
+                   // wait 
+                    elevator.current_level++;
+                } else {
+                    elevator.current_level--;
+                }
+
+                // Simulate travel time
+                vTaskDelay(5000 / portTICK_PERIOD_MS);
+            }
+
+            // Simulate unloading time
+            vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+            // Set elevator to idle
+            elevator.state = ELEVATOR_IDLE;
+        }*/
+    }
 void app_main() {
 
     //Initialize travel needs (50 randomly generated travel needs)
@@ -133,36 +165,37 @@ void app_main() {
 
 
 
-    gpio_config_t config; 
+     gpio_config_t config;
+    // Configure pins as output
+    config.pin_bit_mask = (1ULL << LED_PIN_LEVEL_UP) | (1ULL << LED_PIN_LEVEL_MIDDLE) | (1ULL << LED_PIN_LEVEL_DOWN);
+    config.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&config);
 
-
-    // Configure pin LED_PIN_LEVEL_UP as output 
-
-
-    // Configure pin LED_PIN_LEVEL_MIDDLE as output 
-
-
-    // Configure pin LED_PIN_LEVEL_DOWN as output 
-
-
-    // Configure pin BUTTON_PIN as input, pull up and with interrupts on the negative edge
-
+    // Configure button pin as input with pull-up and interrupt
+    config.pin_bit_mask = (1ULL << BUTTON_PIN);
+    config.mode = GPIO_MODE_INPUT;
+    config.pull_up_en = GPIO_PULLUP_ENABLE;
+    config.intr_type = GPIO_INTR_NEGEDGE;
+    gpio_config(&config);
 
     // Activate the interrupts for the GPIOs
-    res = gpio_install_isr_service(0);
-    ESP_ERROR_CHECK(res);
+    //gpio_install_isr_service(0);
+    //gpio_isr_handler_add(BUTTON_PIN, handle_push, NULL);
+    // Activate the interrupts for the GPIOs
+    gpio_install_isr_service(0);
+
+
+   
 
     // Add a handler to the ISR for pin BUTTON_PIN
-    res = gpio_isr_handler_add(BUTTON_PIN, handle_push, NULL);
-    ESP_ERROR_CHECK(res);
-
+     gpio_isr_handler_add(BUTTON_PIN, handle_push, NULL);
+  
 
     // This is where you most likely put your main elevator code. 
-    while(1) {
+    while (1) {
+       lala();
     }
-
       
-      
-    
+  
        
 }
